@@ -4,6 +4,7 @@
   python -m pwncorpus.cli token --db corpus.db --label ingestor --scopes ingest
   python -m pwncorpus.cli ingest --db corpus.db --source breach-2026Q3 --file leaks.txt
   python -m pwncorpus.cli build --db corpus.db --k 50
+  python -m pwncorpus.cli refresh --db corpus.db --version 3
   python -m pwncorpus.cli activate --db corpus.db --version 3
   python -m pwncorpus.cli retract --db corpus.db --batch <id>
   python -m pwncorpus.cli export --db corpus.db --version 3 --out export-v3/
@@ -44,7 +45,12 @@ def main(argv=None) -> int:
     p.add_argument("--k", type=int, default=core.DEFAULT_THRESHOLD_K,
                    help="minimum bucket set size")
 
-    p = sub.add_parser("activate", help="atomically activate a candidate")
+    p = sub.add_parser("activate", help="atomically activate a candidate "
+                       "(fails with a conflict if the candidate is stale)")
+    p.add_argument("--version", type=int, required=True)
+
+    p = sub.add_parser("refresh", help="rebuild a stale candidate from current "
+                       "source data, keeping its version and threshold k")
     p.add_argument("--version", type=int, required=True)
 
     p = sub.add_parser("retract", help="retract a batch (effective next build)")
@@ -115,6 +121,10 @@ def main(argv=None) -> int:
             print(json.dumps(core.activate(conn, args.version), indent=2))
             return 0
 
+        if args.cmd == "refresh":
+            print(json.dumps(core.refresh_candidate(conn, args.version), indent=2))
+            return 0
+
         if args.cmd == "retract":
             print(json.dumps(core.retract_batch(conn, args.batch), indent=2))
             return 0
@@ -144,6 +154,7 @@ def main(argv=None) -> int:
             state = core.review_state(conn)
             print(json.dumps({
                 "active_version": core.current_version(conn),
+                "corpus_state": state["corpus_state"],
                 "publications": state["publications"],
                 "stats": state["stats"],
             }, indent=2))

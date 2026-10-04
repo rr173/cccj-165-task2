@@ -151,9 +151,20 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                 if m:
                     if not self._require(conn, "publish"):
                         return
-                    return self._json(200, core.activate(conn, int(m.group(1))))
+                    length = int(self.headers.get("Content-Length") or 0)
+                    payload = self._body_json() if length else {}
+                    return self._json(200, core.activate(
+                        conn, int(m.group(1)),
+                        expected_manifest=payload.get("expected_manifest")))
+                m = re.fullmatch(r"/api/publications/(\d+)/refresh", path)
+                if m:
+                    if not self._require(conn, "publish"):
+                        return
+                    return self._json(200, core.refresh_candidate(conn, int(m.group(1))))
                 if path == "/review/activate":
                     return self._review_activate(conn)
+                if path == "/review/refresh":
+                    return self._review_refresh(conn)
                 return self._error(404, "not found")
             except core.NotFound as exc:
                 return self._error(404, str(exc))
@@ -192,8 +203,10 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
             pub = core.get_publication(conn, version)
             active_v = core.current_version(conn)
             out = {"publication": pub, "active_version": active_v}
-            if pub["status"] == "candidate" and active_v is not None:
-                out["diff_vs_active"] = core.diff_versions(conn, active_v, version)
+            if pub["status"] == "candidate":
+                pub["stale"] = pub["corpus_state"] != core.corpus_state(conn)
+                if active_v is not None:
+                    out["diff_vs_active"] = core.diff_versions(conn, active_v, version)
             return self._json(200, out)
 
         def _manifest(self, conn, version):
@@ -219,14 +232,41 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                 version = int(form.get("version", ["0"])[0])
             except ValueError:
                 return self._error(400, "bad version")
+            expected = form.get("expected_manifest", [None])[0] or None
             try:
-                core.activate(conn, version)
+                core.activate(conn, version, expected_manifest=expected)
             except core.CorpusError as exc:
                 return self._error(409, str(exc))
             tok_q = f"?token={html.escape(token)}"
             self._send(
                 200,
                 f"<html><body><h2>Publication v{version} activated</h2>"
+                f"<p><a href='/review{tok_q}'>back to review</a></p></body></html>",
+                "text/html; charset=utf-8",
+            )
+
+        def _review_refresh(self, conn):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0 or length > 65536:
+                return self._error(400, "bad form")
+            form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+            token = form.get("token", [""])[0]
+            row = core.lookup_token(conn, token) if token else None
+            if row is None or "publish" not in row["scopes"].split(","):
+                return self._error(403, "invalid token or missing 'publish' scope")
+            try:
+                version = int(form.get("version", ["0"])[0])
+            except ValueError:
+                return self._error(400, "bad version")
+            try:
+                core.refresh_candidate(conn, version)
+            except core.CorpusError as exc:
+                return self._error(409, str(exc))
+            tok_q = f"?token={html.escape(token)}"
+            self._send(
+                200,
+                f"<html><body><h2>Candidate v{version} refreshed from current"
+                " source data (threshold k kept)</h2>"
                 f"<p><a href='/review{tok_q}'>back to review</a></p></body></html>",
                 "text/html; charset=utf-8",
             )
@@ -247,7 +287,7 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                               "bucket_count", "suffix_count",
                               "suppressed_bucket_count", "created_at",
                               "activated_at", "retired_at", "corpus_sha256",
-                              "manifest_sha256")
+                              "corpus_state", "manifest_sha256")
                 )
                 return f"<div class='card'><h3>{title}</h3><table>{rows}</table></div>"
 
@@ -270,14 +310,35 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                 <th>old count</th><th>new count</th></tr>{sample}</table>
                 <p class='muted'>showing at most 100 sampled rows</p></div>"""
 
-            activate_html = ""
-            if state["candidate"]:
-                v = state["candidate"]["version"]
-                activate_html = f"""
+            action_html = ""
+            candidate = state["candidate"]
+            if candidate:
+                v = candidate["version"]
+                if candidate["stale"]:
+                    action_html = f"""
+                <div class='card stale'><h3>Candidate v{v} is STALE</h3>
+                <p>Source data changed after this draft was built (new batch,
+                retraction or corrections). Activating the old snapshot would
+                overwrite the newer source state, so activation is blocked.
+                Refresh the draft to rebuild it from current data &mdash; the
+                threshold k={candidate['threshold_k']} is kept &mdash; then
+                review and activate as usual.</p>
+                <form method='post' action='/review/refresh'>
+                  <input type='hidden' name='version' value='{v}'>
+                  <label>re-enter publish token:
+                    <input type='password' name='token' required></label>
+                  <button type='submit'>Refresh candidate v{v}</button>
+                </form></div>"""
+                else:
+                    action_html = f"""
                 <div class='card'><h3>Activate candidate v{v}</h3>
+                <p>The draft matches current source data
+                (corpus-state {candidate['corpus_state']}).</p>
                 <form method='post' action='/review/activate'
                       onsubmit="return confirm('Activate publication v{v}? Old version stays verifiable but stops serving queries.');">
                   <input type='hidden' name='version' value='{v}'>
+                  <input type='hidden' name='expected_manifest'
+                         value='{e(candidate["manifest_sha256"])}'>
                   <label>re-enter publish token:
                     <input type='password' name='token' required></label>
                   <button type='submit'>Activate v{v}</button>
@@ -298,20 +359,25 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                 for p in state["publications"]
             )
             s = state["stats"]
+            cand_title = "Latest candidate (not serving)"
+            if candidate and candidate["stale"]:
+                cand_title += " — STALE: source data changed"
             page = f"""<!doctype html><html><head><meta charset='utf-8'>
 <title>pwncorpus publication review</title><style>
 body{{font-family:system-ui,sans-serif;margin:2rem;background:#f6f7f9;color:#222}}
 .card{{background:#fff;border:1px solid #ddd;border-radius:8px;padding:1rem;margin:1rem 0}}
+.stale{{border-color:#c33;background:#fff5f5}}
 table{{border-collapse:collapse;font-size:.9rem}}td,th{{border:1px solid #ccc;padding:.3rem .6rem;text-align:left}}
 th{{background:#eee}}.mono{{font-family:monospace}}.muted{{color:#777;font-size:.8rem}}
 button{{padding:.4rem 1rem}}</style></head><body>
 <h2>Publication review</h2>
 <p>active batches: {s['active_batches']} &nbsp; retracted: {s['retracted_batches']}
-   &nbsp; corrections pending: {s['corrections']}</p>
+   &nbsp; corrections pending: {s['corrections']}
+   &nbsp; source-state token: {state['corpus_state']}</p>
 {pub_card('Active publication (serving queries)', state['active'])}
-{pub_card('Latest candidate (not serving)', state['candidate'])}
+{pub_card(cand_title, candidate)}
 {diff_html}
-{activate_html}
+{action_html}
 <div class='card'><h3>Recent batches</h3>
 <table><tr><th>batch</th><th>source</th><th>distinct</th><th>occurrences</th>
 <th>status</th><th>created</th></tr>{batches}</table></div>

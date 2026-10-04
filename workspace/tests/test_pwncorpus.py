@@ -14,6 +14,7 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -230,6 +231,181 @@ class CoreCase(unittest.TestCase):
         self.assertIn(sha1(secret).encode(), raw)  # fingerprint IS there
         self.conn = db.connect(self.db_path)
 
+    # -- draft staleness / refresh -----------------------------------------
+    def test_ingest_before_confirm_blocks_activation(self):
+        pa = pw_with_prefix("A1", 2, tag="first")
+        pb = pw_with_prefix("B2", 2, tag="late")
+        core.ingest_batch(self.conn, "base", pa)
+        v1 = self.publish(k=1)
+        info = core.build_candidate(self.conn, k=1)  # draft of current data
+        # source data changes while the draft awaits confirmation
+        core.ingest_batch(self.conn, "late-arrival", pb)
+        self.assertTrue(core.review_state(self.conn)["candidate"]["stale"])
+        with self.assertRaises(core.Conflict):
+            core.activate(self.conn, info["version"])
+        # the confirmation did not take effect; serving version unchanged
+        self.assertEqual(core.current_version(self.conn), v1)
+        v, body = core.query_range(self.conn, "B2")
+        self.assertEqual((v, body), (v1, None))  # late batch not served
+        _, body = core.query_range(self.conn, "A1")
+        self.assertIsNotNone(body)
+
+    def test_activate_before_ingest_leaves_update_for_next_version(self):
+        pa = pw_with_prefix("A3", 2, tag="base")
+        pb = pw_with_prefix("B4", 2, tag="next")
+        core.ingest_batch(self.conn, "base", pa)
+        self.publish(k=1)
+        info = core.build_candidate(self.conn, k=1)
+        core.activate(self.conn, info["version"])  # confirmation commits first
+        core.ingest_batch(self.conn, "late", pb)   # later source update
+        v, body = core.query_range(self.conn, "B4")
+        self.assertEqual(v, info["version"])
+        self.assertIsNone(body)  # not in the just-activated version
+        nxt = core.build_candidate(self.conn, k=1)  # ...waits for the next one
+        core.activate(self.conn, nxt["version"])
+        _, body = core.query_range(self.conn, "B4")
+        self.assertIsNotNone(body)
+
+    def test_refresh_candidate_keeps_threshold_and_version(self):
+        pa = pw_with_prefix("C1", 3, tag="r1")
+        core.ingest_batch(self.conn, "s1", pa)
+        self.publish(k=2)
+        info = core.build_candidate(self.conn, k=2)
+        pb = pw_with_prefix("C1", 2, start=100, tag="r2")
+        core.ingest_batch(self.conn, "s2", pb)  # makes the draft stale
+        out = core.refresh_candidate(self.conn, info["version"])
+        self.assertEqual(out["version"], info["version"])   # same draft
+        self.assertEqual(out["threshold_k"], 2)             # threshold kept
+        self.assertEqual(out["suffix_count"], 5)
+        self.assertFalse(core.review_state(self.conn)["candidate"]["stale"])
+        core.activate(self.conn, info["version"])  # now allowed
+        _, body = core.query_range(self.conn, "C1")
+        self.assertEqual(len(body.strip().split("\n")), 5)
+        # refresh is only for candidates
+        with self.assertRaises(core.Conflict):
+            core.refresh_candidate(self.conn, info["version"])  # now active
+        with self.assertRaises(core.NotFound):
+            core.refresh_candidate(self.conn, 999)
+
+    def test_retract_and_corrections_stale_the_candidate(self):
+        pa = pw_with_prefix("D1", 2, tag="d1")
+        pb = pw_with_prefix("D2", 2, tag="d2")
+        b1 = core.ingest_batch(self.conn, "s1", pa)
+        b2 = core.ingest_batch(self.conn, "s2", pb)
+        self.publish(k=1)
+        info = core.build_candidate(self.conn, k=1)
+        core.retract_batch(self.conn, b1["batch_id"])
+        self.assertTrue(core.review_state(self.conn)["candidate"]["stale"])
+        with self.assertRaises(core.Conflict):
+            core.activate(self.conn, info["version"])
+        core.refresh_candidate(self.conn, info["version"])
+        self.assertFalse(core.review_state(self.conn)["candidate"]["stale"])
+        core.add_corrections(self.conn, b2["batch_id"], [pb[0]])
+        self.assertTrue(core.review_state(self.conn)["candidate"]["stale"])
+        core.refresh_candidate(self.conn, info["version"])
+        core.activate(self.conn, info["version"])
+        _, body = core.query_range(self.conn, "D1")
+        self.assertIsNone(body)  # retracted batch is gone
+        _, body = core.query_range(self.conn, "D2")
+        self.assertEqual(len(body.strip().split("\n")), 1)  # one corrected away
+
+    def test_noop_source_writes_do_not_stale_candidate(self):
+        pa = pw_with_prefix("E1", 2, tag="e1")
+        b = core.ingest_batch(self.conn, "s", pa)
+        self.publish(k=1)
+        info = core.build_candidate(self.conn, k=1)
+
+        def stale():
+            return core.review_state(self.conn)["candidate"]["stale"]
+
+        core.ingest_batch(self.conn, "s", list(pa))  # duplicate batch: no change
+        self.assertFalse(stale())
+        core.retract_batch(self.conn, b["batch_id"])  # effective
+        self.assertTrue(stale())
+        core.refresh_candidate(self.conn, info["version"])
+        core.retract_batch(self.conn, b["batch_id"])  # no-op: already retracted
+        self.assertFalse(stale())
+        core.add_corrections(self.conn, b["batch_id"], [pa[0]])  # new rows
+        self.assertTrue(stale())
+        core.refresh_candidate(self.conn, info["version"])
+        core.add_corrections(self.conn, b["batch_id"], [pa[0]])  # duplicates
+        self.assertFalse(stale())
+        core.activate(self.conn, info["version"])  # unchanged path still works
+
+    def test_activate_expected_manifest_binding(self):
+        pa = pw_with_prefix("F1", 2, tag="f1")
+        core.ingest_batch(self.conn, "s", pa)
+        self.publish(k=1)
+        info = core.build_candidate(self.conn, k=1)
+        with self.assertRaises(core.Conflict):
+            core.activate(self.conn, info["version"], expected_manifest="0" * 64)
+        # a refresh replaces the draft: a confirmation prepared before it
+        # (bound to the old manifest) must no longer go through
+        pb = pw_with_prefix("F2", 2, tag="f2")
+        core.ingest_batch(self.conn, "s2", pb)
+        core.refresh_candidate(self.conn, info["version"])
+        with self.assertRaises(core.Conflict):
+            core.activate(self.conn, info["version"],
+                          expected_manifest=info["manifest_sha256"])
+        pub = core.get_publication(self.conn, info["version"])
+        core.activate(self.conn, info["version"],
+                      expected_manifest=pub["manifest_sha256"])
+        self.assertEqual(core.current_version(self.conn), info["version"])
+
+    def test_concurrent_activate_and_ingest_ordering(self):
+        pa = pw_with_prefix("80", 2, tag="raceA")
+        pb = pw_with_prefix("81", 2, tag="raceB")
+        core.ingest_batch(self.conn, "A", pa)
+        v1 = self.publish(k=1)
+        info = core.build_candidate(self.conn, k=1)  # candidate holds only A
+        barrier = threading.Barrier(2)
+        outcome, errors = {}, []
+
+        def do_ingest():
+            c = db.connect(self.db_path)
+            try:
+                barrier.wait()
+                outcome["ingest"] = core.ingest_batch(c, "B", list(pb))
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+            finally:
+                c.close()
+
+        def do_activate():
+            c = db.connect(self.db_path)
+            try:
+                barrier.wait()
+                try:
+                    outcome["activate"] = core.activate(c, info["version"])
+                except core.Conflict as exc:
+                    outcome["activate_conflict"] = str(exc)
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+            finally:
+                c.close()
+
+        t1 = threading.Thread(target=do_ingest)
+        t2 = threading.Thread(target=do_activate)
+        t1.start(); t2.start(); t1.join(); t2.join()
+        self.assertEqual(errors, [])
+        self.assertIn("ingest", outcome)  # the source write always commits
+        if "activate_conflict" in outcome:
+            # update committed first: confirmation rejected, serving unchanged
+            self.assertEqual(core.current_version(self.conn), v1)
+            v, body = core.query_range(self.conn, "81")
+            self.assertEqual((v, body), (v1, None))
+        else:
+            # activation committed first: update waits for the next version
+            self.assertEqual(core.current_version(self.conn), info["version"])
+            v, body = core.query_range(self.conn, "81")
+            self.assertEqual(v, info["version"])
+            self.assertIsNone(body)
+        # either way the late batch is picked up by the NEXT build
+        nxt = core.build_candidate(self.conn, k=1)
+        core.activate(self.conn, nxt["version"])
+        _, body = core.query_range(self.conn, "81")
+        self.assertIsNotNone(body)
+
 
 class ServerCase(unittest.TestCase):
     def setUp(self):
@@ -267,6 +443,17 @@ class ServerCase(unittest.TestCase):
                 return e.code, json.loads(payload), dict(e.headers)
             except json.JSONDecodeError:
                 return e.code, payload, dict(e.headers)
+
+    def http_form(self, path, fields):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = urllib.parse.urlencode(fields).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
 
     def publish(self, k=2):
         st, body, _ = self.http("POST", "/api/publications/build", {"k": k},
@@ -438,6 +625,92 @@ class ServerCase(unittest.TestCase):
         st, body, _ = self.http("GET", f"/review?token={self.tok_pub}", raw=True)
         self.assertEqual(st, 200)
         self.assertIn(b"Publication review", body)
+
+    def test_stale_activation_rejected_and_refresh_over_api(self):
+        pa = pw_with_prefix("A0", 2, tag="apiA")
+        pb = pw_with_prefix("A1", 2, tag="apiB")
+        self.http("POST", "/api/batches", {"source": "a", "items": pa},
+                  token=self.tok_ingest)
+        v1 = self.publish(k=1)
+        st, cand, _ = self.http("POST", "/api/publications/build", {"k": 1},
+                                token=self.tok_pub)
+        v2 = cand["version"]
+        # source data changes before the draft is confirmed
+        self.http("POST", "/api/batches", {"source": "b", "items": pb},
+                  token=self.tok_ingest)
+        st, body, _ = self.http("POST", f"/api/publications/{v2}/activate",
+                                token=self.tok_pub)
+        self.assertEqual(st, 409)
+        self.assertIn("stale", body["error"])
+        # the serving version is untouched
+        st, _, hdr = self.http("GET", "/api/range/A1")
+        self.assertEqual((st, hdr.get("X-Corpus-Version")), (404, str(v1)))
+        # the detail endpoint flags the stale draft
+        st, detail, _ = self.http("GET", f"/api/publications/{v2}",
+                                  token=self.tok_pub)
+        self.assertTrue(detail["publication"]["stale"])
+        # refresh keeps version + threshold, then activation succeeds
+        st, refreshed, _ = self.http("POST", f"/api/publications/{v2}/refresh",
+                                     token=self.tok_pub)
+        self.assertEqual(st, 200)
+        self.assertEqual((refreshed["version"], refreshed["threshold_k"]), (v2, 1))
+        st, detail, _ = self.http("GET", f"/api/publications/{v2}",
+                                  token=self.tok_pub)
+        self.assertFalse(detail["publication"]["stale"])
+        st, _, _ = self.http("POST", f"/api/publications/{v2}/activate",
+                             token=self.tok_pub)
+        self.assertEqual(st, 200)
+        st, body, hdr = self.http("GET", "/api/range/A1", raw=True)
+        self.assertEqual(st, 200)
+        self.assertEqual(hdr.get("X-Corpus-Version"), str(v2))
+        # refresh is only for candidates
+        st, _, _ = self.http("POST", f"/api/publications/{v2}/refresh",
+                             token=self.tok_pub)
+        self.assertEqual(st, 409)
+
+    def test_review_page_stale_banner_and_refresh_form(self):
+        pa = pw_with_prefix("B0", 2, tag="pgA")
+        pb = pw_with_prefix("B1", 2, tag="pgB")
+        self.http("POST", "/api/batches", {"source": "a", "items": pa},
+                  token=self.tok_ingest)
+        self.publish(k=1)
+        st, cand, _ = self.http("POST", "/api/publications/build", {"k": 1},
+                                token=self.tok_pub)
+        v2 = cand["version"]
+        self.http("POST", "/api/batches", {"source": "b", "items": pb},
+                  token=self.tok_ingest)
+        # stale draft: banner + refresh form, no activate form
+        st, page, _ = self.http("GET", f"/review?token={self.tok_pub}", raw=True)
+        self.assertEqual(st, 200)
+        self.assertIn(b"STALE", page)
+        self.assertIn(b"/review/refresh", page)
+        self.assertNotIn(b"Activate v", page)
+        # confirming the stale draft via the form is rejected, serving intact
+        st, _ = self.http_form("/review/activate",
+                               {"version": v2, "token": self.tok_pub})
+        self.assertEqual(st, 409)
+        _, health, _ = self.http("GET", "/api/health")
+        self.assertNotEqual(health["active_version"], v2)
+        # refresh via the review form (token re-entry), then activate
+        st, _ = self.http_form("/review/refresh",
+                               {"version": v2, "token": self.tok_pub})
+        self.assertEqual(st, 200)
+        st, page, _ = self.http("GET", f"/review?token={self.tok_pub}", raw=True)
+        self.assertIn(b"Activate v", page)
+        # the confirmation is bound to the reviewed draft's manifest
+        st, detail, _ = self.http("GET", f"/api/publications/{v2}",
+                                  token=self.tok_pub)
+        manifest = detail["publication"]["manifest_sha256"]
+        st, _ = self.http_form("/review/activate",
+                               {"version": v2, "token": self.tok_pub,
+                                "expected_manifest": "bogus"})
+        self.assertEqual(st, 409)
+        st, _ = self.http_form("/review/activate",
+                               {"version": v2, "token": self.tok_pub,
+                                "expected_manifest": manifest})
+        self.assertEqual(st, 200)
+        _, health, _ = self.http("GET", "/api/health")
+        self.assertEqual(health["active_version"], v2)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,12 @@ Invariants enforced here:
     is possible.
   * Range queries read the version pointer and the bucket rows inside a single
     SQLite snapshot, so a query can never mix two versions.
+  * A candidate records the corpus-state token of the snapshot it was built
+    from. Source mutations (new batch / retraction / corrections) advance the
+    token inside their own write transaction; activation compares the tokens
+    and rejects a stale candidate instead of letting an old snapshot override
+    newer source state. A stale candidate can be refreshed in place (same
+    version, same k) and reviewed again.
 """
 from __future__ import annotations
 
@@ -74,6 +80,26 @@ def canonical_json(obj) -> str:
 
 
 # --------------------------------------------------------------------------
+# Corpus-state token (staleness detection for candidates)
+# --------------------------------------------------------------------------
+
+def corpus_state(conn) -> int:
+    """Monotonic token identifying the current source-data state. It is bumped
+    by every EFFECTIVE corpus mutation (new batch, retraction, new correction
+    rows) inside the same write transaction as the mutation itself, so a
+    candidate built at token N is stale iff the current token differs from N."""
+    r = conn.execute("SELECT value FROM meta WHERE key='corpus_state'").fetchone()
+    return int(r["value"]) if r else 0
+
+
+def _bump_corpus_state(conn) -> None:
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES ('corpus_state', '1')"
+        " ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1"
+    )
+
+
+# --------------------------------------------------------------------------
 # Auth tokens
 # --------------------------------------------------------------------------
 
@@ -132,6 +158,7 @@ def ingest_batch(conn, source: str, items, idem_key: str | None = None) -> dict:
                 "INSERT INTO batch_items(batch_id, hash_hex, cnt) VALUES (?,?,?)",
                 [(batch_id, h, c) for h, c in counts.items()],
             )
+            _bump_corpus_state(conn)
         return {
             "batch_id": batch_id, "duplicate": False,
             "distinct_fingerprints": len(counts),
@@ -164,6 +191,7 @@ def retract_batch(conn, batch_id: str) -> dict:
                 "UPDATE batches SET status='retracted', retracted_at=? WHERE batch_id=?",
                 (utcnow(), batch_id),
             )
+            _bump_corpus_state(conn)
     return {
         "batch_id": batch_id, "status": "retracted",
         "note": "effective in the next publication build; current version unchanged",
@@ -180,10 +208,13 @@ def add_corrections(conn, batch_id: str, items) -> dict:
     with db.write_tx(conn):
         if conn.execute("SELECT 1 FROM batches WHERE batch_id = ?", (batch_id,)).fetchone() is None:
             raise NotFound("batch not found")
+        before = conn.total_changes
         conn.executemany(
             "INSERT OR IGNORE INTO corrections(batch_id, hash_hex, created_at) VALUES (?,?,?)",
             [(batch_id, h, utcnow()) for h in hashes],
         )
+        if conn.total_changes > before:  # only genuinely new corrections matter
+            _bump_corpus_state(conn)
     return {
         "batch_id": batch_id, "corrected_fingerprints": len(hashes),
         "note": "effective in the next publication build; current version unchanged",
@@ -230,15 +261,30 @@ def _manifest_payload(version: int, k: int, created_at: str,
     }
 
 
+def _corpus_snapshot(conn) -> tuple[list[tuple[str, int]], int]:
+    """Read the active corpus AND the corpus-state token in one snapshot, so
+    the recorded token always corresponds to the data that was aggregated."""
+    conn.execute("BEGIN")  # deferred read transaction = stable snapshot
+    try:
+        return _active_corpus(conn), corpus_state(conn)
+    finally:
+        conn.execute("ROLLBACK")
+
+
 def build_candidate(conn, k: int = DEFAULT_THRESHOLD_K) -> dict:
     """Materialise a new candidate publication from the current active corpus.
 
     Buckets with fewer than k distinct suffixes are suppressed entirely.
-    The candidate is immutable and does not affect the active version.
+    The candidate does not affect the active version; if source data changes
+    afterwards the candidate becomes stale (see activate/refresh_candidate).
+
+    The corpus and the corpus-state token are read in one snapshot and the
+    token is re-checked before the insert commits, so the recorded token
+    always matches the data the candidate was built from.
     """
     if not isinstance(k, int) or not (1 <= k <= MAX_THRESHOLD_K):
         raise CorpusError("invalid threshold k")
-    corpus = _active_corpus(conn)  # single-statement snapshot
+    corpus, state = _corpus_snapshot(conn)
     corpus_hash = hashlib.sha256(
         "\n".join(f"{h}:{c}" for h, c in corpus).encode()
     ).hexdigest()
@@ -248,11 +294,13 @@ def build_candidate(conn, k: int = DEFAULT_THRESHOLD_K) -> dict:
     suffix_count = sum(len(v) for v in kept.values())
     now = utcnow()
     with db.write_tx(conn):
+        if corpus_state(conn) != state:
+            raise Conflict("source data changed while building; retry the build")
         cur = conn.execute(
             "INSERT INTO publications(threshold_k, prefix_len, status, created_at,"
             " bucket_count, suffix_count, suppressed_bucket_count, corpus_sha256,"
-            " manifest_sha256) VALUES (?,?, 'candidate', ?, ?,?,?,?, '')",
-            (k, PREFIX_LEN, now, len(kept), suffix_count, suppressed, corpus_hash),
+            " corpus_state, manifest_sha256) VALUES (?,?, 'candidate', ?, ?,?,?,?,?, '')",
+            (k, PREFIX_LEN, now, len(kept), suffix_count, suppressed, corpus_hash, state),
         )
         version = cur.lastrowid
         conn.executemany(
@@ -270,21 +318,100 @@ def build_candidate(conn, k: int = DEFAULT_THRESHOLD_K) -> dict:
         "prefix_len": PREFIX_LEN, "bucket_count": len(kept),
         "suffix_count": suffix_count, "suppressed_bucket_count": suppressed,
         "corpus_sha256": corpus_hash, "manifest_sha256": mhash,
+        "corpus_state": state,
     }
 
 
-def activate(conn, version: int) -> dict:
+def refresh_candidate(conn, version: int) -> dict:
+    """Rebuild a candidate from the CURRENT source data, in place: same
+    version number, same threshold k. This is the way out of a stale-draft
+    conflict — the refreshed candidate can be previewed and activated again.
+    Published (active/retired) versions are never touched."""
+    conn.execute("BEGIN")
+    try:
+        row = conn.execute(
+            "SELECT status, threshold_k FROM publications WHERE version = ?",
+            (version,)).fetchone()
+        if row is None:
+            raise NotFound("publication not found")
+        if row["status"] != "candidate":
+            raise Conflict(
+                f"publication {version} is '{row['status']}';"
+                " only a candidate can be refreshed")
+        k = row["threshold_k"]
+        corpus = _active_corpus(conn)
+        state = corpus_state(conn)
+    finally:
+        conn.execute("ROLLBACK")
+    corpus_hash = hashlib.sha256(
+        "\n".join(f"{h}:{c}" for h, c in corpus).encode()
+    ).hexdigest()
+    buckets = _bucketize(corpus, PREFIX_LEN)
+    kept = {p: v for p, v in buckets.items() if len(v) >= k}
+    suppressed = len(buckets) - len(kept)
+    suffix_count = sum(len(v) for v in kept.values())
+    now = utcnow()
+    with db.write_tx(conn):
+        if corpus_state(conn) != state:
+            raise Conflict("source data changed while refreshing; retry the refresh")
+        cur = conn.execute(
+            "SELECT status FROM publications WHERE version = ?", (version,)).fetchone()
+        if cur["status"] != "candidate":  # e.g. activated concurrently
+            raise Conflict(
+                f"publication {version} is '{cur['status']}';"
+                " only a candidate can be refreshed")
+        conn.execute("DELETE FROM pub_buckets WHERE version = ?", (version,))
+        conn.executemany(
+            "INSERT INTO pub_buckets(version, prefix, suffix, cnt) VALUES (?,?,?,?)",
+            [(version, p, s, c) for p, entries in kept.items() for s, c in entries],
+        )
+        manifest = _manifest_payload(version, k, now, kept, PREFIX_LEN)
+        mhash = hashlib.sha256(canonical_json(manifest).encode()).hexdigest()
+        conn.execute(
+            "UPDATE publications SET created_at=?, bucket_count=?, suffix_count=?,"
+            " suppressed_bucket_count=?, corpus_sha256=?, manifest_sha256=?,"
+            " corpus_state=? WHERE version=?",
+            (now, len(kept), suffix_count, suppressed, corpus_hash, mhash,
+             state, version),
+        )
+    return {
+        "version": version, "status": "candidate", "threshold_k": k,
+        "prefix_len": PREFIX_LEN, "bucket_count": len(kept),
+        "suffix_count": suffix_count, "suppressed_bucket_count": suppressed,
+        "corpus_sha256": corpus_hash, "manifest_sha256": mhash,
+        "corpus_state": state, "refreshed": True,
+    }
+
+
+def activate(conn, version: int, expected_manifest: str | None = None) -> dict:
     """Atomically switch the active publication. Single write transaction:
     old active -> retired, candidate -> active, pointer swap. Concurrent
-    queries see either the old or the new version, never a mix."""
+    queries see either the old or the new version, never a mix.
+
+    The switch is a compare-and-swap against concurrent source writes: the
+    candidate carries the corpus-state token of the snapshot it was built
+    from. If a source update (new batch, retraction, corrections) committed
+    first, the tokens differ and the activation is rejected WITHOUT touching
+    the serving version; if the activation commits first, the later source
+    update simply waits for the next build. ``expected_manifest`` optionally
+    binds the confirmation to the exact draft the admin reviewed.
+    """
     with db.write_tx(conn):
         row = conn.execute(
-            "SELECT status FROM publications WHERE version = ?", (version,)
-        ).fetchone()
+            "SELECT status, manifest_sha256, corpus_state FROM publications"
+            " WHERE version = ?", (version,)).fetchone()
         if row is None:
             raise NotFound("publication not found")
         if row["status"] != "candidate":
             raise Conflict(f"publication {version} is '{row['status']}'; only a candidate can be activated")
+        if expected_manifest is not None and expected_manifest != row["manifest_sha256"]:
+            raise Conflict(
+                f"publication {version} changed since this confirmation was"
+                " prepared; reload the review page")
+        if row["corpus_state"] != corpus_state(conn):
+            raise Conflict(
+                f"publication {version} is stale: source data changed after it"
+                " was built; refresh the candidate and review again")
         now = utcnow()
         conn.execute(
             "UPDATE publications SET status='retired', retired_at=? WHERE status='active'",
@@ -387,8 +514,11 @@ def diff_versions(conn, old_v: int, new_v: int) -> dict:
 
 
 def review_state(conn) -> dict:
-    active_v = current_version(conn)
+    token = corpus_state(conn)
     pubs = list_publications(conn)
+    for p in pubs:
+        if p["status"] == "candidate":
+            p["stale"] = p["corpus_state"] != token
     active = next((p for p in pubs if p["status"] == "active"), None)
     candidate = next((p for p in pubs if p["status"] == "candidate"), None)
     diff = None
@@ -403,7 +533,7 @@ def review_state(conn) -> dict:
     return {
         "active": active, "candidate": candidate, "diff": diff,
         "publications": pubs, "batches": list_batches(conn),
-        "stats": dict(stats),
+        "stats": dict(stats), "corpus_state": token,
     }
 
 

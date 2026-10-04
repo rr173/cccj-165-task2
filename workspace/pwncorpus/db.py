@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS publications (
   suffix_count             INTEGER NOT NULL,
   suppressed_bucket_count  INTEGER NOT NULL DEFAULT 0,
   corpus_sha256            TEXT NOT NULL,           -- hash of the full active corpus snapshot
+  corpus_state             INTEGER NOT NULL DEFAULT 0,  -- source-state token at build/refresh time
   manifest_sha256          TEXT NOT NULL            -- hash of the canonical manifest
 );
 
@@ -86,7 +87,22 @@ def connect(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA synchronous=NORMAL")
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Idempotent schema upgrades for databases created by older versions."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(publications)")}
+    if not cols:
+        return  # fresh database; init() applies the full schema next
+    if "corpus_state" not in cols:
+        try:
+            conn.execute("ALTER TABLE publications ADD COLUMN"
+                         " corpus_state INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError as exc:  # another connection beat us to it
+            if "duplicate column" not in str(exc).lower():
+                raise
 
 
 def init(path: str) -> None:
