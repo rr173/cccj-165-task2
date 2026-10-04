@@ -230,6 +230,126 @@ class CoreCase(unittest.TestCase):
         self.assertIn(sha1(secret).encode(), raw)  # fingerprint IS there
         self.conn = db.connect(self.db_path)
 
+    def test_stale_candidate_rejected_then_refresh_keeps_threshold(self):
+        core.ingest_batch(self.conn, "s1", pw_with_prefix("A0", 2, tag="one"))
+        v1 = self.publish(k=2)
+        info = core.build_candidate(self.conn, k=2)
+        v2 = info["version"]
+        # no source change yet: draft is fresh and review agrees
+        state = core.review_state(self.conn)
+        self.assertFalse(state["candidate"]["stale"])
+        self.assertEqual(state["corpus_sha256"], info["corpus_sha256"])
+        # source data changes AFTER the draft was built
+        core.ingest_batch(self.conn, "s2", pw_with_prefix("A1", 2, tag="two"))
+        state = core.review_state(self.conn)
+        self.assertTrue(state["candidate"]["stale"])
+        # activation must not let the old snapshot overwrite the newer state
+        with self.assertRaises(core.Conflict):
+            core.activate(self.conn, v2)
+        self.assertEqual(core.current_version(self.conn), v1)  # serving unchanged
+        _, body = core.query_range(self.conn, "A1")
+        self.assertIsNone(body)  # new batch not served either
+        # refresh keeps the original threshold and unblocks activation
+        r = core.refresh_candidate(self.conn, v2)
+        self.assertEqual(r["threshold_k"], 2)
+        self.assertTrue(r["was_stale"])
+        self.assertFalse(core.review_state(self.conn)["candidate"]["stale"])
+        core.activate(self.conn, v2)
+        self.assertEqual(core.current_version(self.conn), v2)
+        _, body = core.query_range(self.conn, "A1")
+        self.assertEqual(len(body.strip().split("\n")), 2)
+
+    def test_retraction_and_correction_make_candidate_stale(self):
+        pw = pw_with_prefix("B0", 2, tag="victim")
+        b = core.ingest_batch(self.conn, "leak", pw)
+        self.publish(k=1)
+        info = core.build_candidate(self.conn, k=1)
+        core.retract_batch(self.conn, b["batch_id"])
+        self.assertTrue(core.review_state(self.conn)["candidate"]["stale"])
+        with self.assertRaises(core.Conflict):
+            core.activate(self.conn, info["version"])
+        # refresh picks up the retraction; activation then works
+        core.refresh_candidate(self.conn, info["version"])
+        core.activate(self.conn, info["version"])
+        _, body = core.query_range(self.conn, "B0")
+        self.assertIsNone(body)
+        # same for corrections on the next round
+        pw2 = pw_with_prefix("B1", 2, tag="oops")
+        b2 = core.ingest_batch(self.conn, "leak-2", pw2)
+        info2 = core.build_candidate(self.conn, k=1)
+        core.add_corrections(self.conn, b2["batch_id"], [pw2[0]])
+        with self.assertRaises(core.Conflict):
+            core.activate(self.conn, info2["version"])
+        core.refresh_candidate(self.conn, info2["version"])
+        core.activate(self.conn, info2["version"])
+        _, body = core.query_range(self.conn, "B1")
+        self.assertEqual(len(body.strip().split("\n")), 1)  # corrected item gone
+
+    def test_activate_vs_source_update_ordering(self):
+        core.ingest_batch(self.conn, "s1", pw_with_prefix("C0", 2, tag="c1"))
+        self.publish(k=2)
+        # activation commits first: the later ingest waits for the next version
+        info = core.build_candidate(self.conn, k=2)
+        core.activate(self.conn, info["version"])
+        core.ingest_batch(self.conn, "s2", pw_with_prefix("C1", 2, tag="c2"))
+        _, body = core.query_range(self.conn, "C1")
+        self.assertIsNone(body)  # not in the serving version
+        # source update commits first: confirmation has no effect
+        info2 = core.build_candidate(self.conn, k=2)
+        core.ingest_batch(self.conn, "s3", pw_with_prefix("C2", 2, tag="c3"))
+        with self.assertRaises(core.Conflict):
+            core.activate(self.conn, info2["version"])
+        self.assertEqual(core.current_version(self.conn), info["version"])
+
+    def test_concurrent_activate_and_ingest_resolve_to_one_order(self):
+        core.ingest_batch(self.conn, "s1", pw_with_prefix("D0", 2, tag="d1"))
+        v1 = self.publish(k=2)
+        info = core.build_candidate(self.conn, k=2)
+        results = {}
+
+        def do_ingest():
+            c = db.connect(self.db_path)
+            try:
+                core.ingest_batch(c, "s2", pw_with_prefix("D1", 2, tag="d2"))
+                results["ingest"] = "ok"
+            finally:
+                c.close()
+
+        def do_activate():
+            c = db.connect(self.db_path)
+            try:
+                core.activate(c, info["version"])
+                results["activate"] = "ok"
+            except core.Conflict:
+                results["activate"] = "conflict"
+            finally:
+                c.close()
+
+        threads = [threading.Thread(target=do_ingest),
+                   threading.Thread(target=do_activate)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(results["ingest"], "ok")
+        if results["activate"] == "ok":
+            # activation committed first: candidate serves, racing batch is
+            # left for the next version
+            self.assertEqual(core.current_version(self.conn), info["version"])
+            _, body = core.query_range(self.conn, "D1")
+            self.assertIsNone(body)
+        else:
+            # ingest committed first: confirmation rejected, serving unchanged
+            self.assertEqual(core.current_version(self.conn), v1)
+
+    def test_refresh_rejected_for_non_candidate(self):
+        core.ingest_batch(self.conn, "s", pw_with_prefix("E0", 2, tag="e"))
+        v1 = self.publish(k=2)  # active, not candidate
+        with self.assertRaises(core.Conflict):
+            core.refresh_candidate(self.conn, v1)
+        with self.assertRaises(core.NotFound):
+            core.refresh_candidate(self.conn, 999)
+
 
 class ServerCase(unittest.TestCase):
     def setUp(self):
@@ -438,6 +558,58 @@ class ServerCase(unittest.TestCase):
         st, body, _ = self.http("GET", f"/review?token={self.tok_pub}", raw=True)
         self.assertEqual(st, 200)
         self.assertIn(b"Publication review", body)
+
+    def test_stale_candidate_flow_over_http(self):
+        self.http("POST", "/api/batches",
+                  {"source": "s", "items": pw_with_prefix("A0", 2, tag="h1")},
+                  token=self.tok_ingest)
+        v1 = self.publish(k=2)
+        st, cand, _ = self.http("POST", "/api/publications/build", {"k": 2},
+                                token=self.tok_pub)
+        v2 = cand["version"]
+        # fresh draft: detail says not stale, review page offers activation
+        st, det, _ = self.http("GET", f"/api/publications/{v2}", token=self.tok_pub)
+        self.assertFalse(det["stale"])
+        st, page, _ = self.http("GET", f"/review?token={self.tok_pub}", raw=True)
+        self.assertIn(b"Activate v", page)
+        self.assertNotIn(b"STALE", page)
+        # source data changes after the draft was built
+        self.http("POST", "/api/batches",
+                  {"source": "s2", "items": pw_with_prefix("A1", 2, tag="h2")},
+                  token=self.tok_ingest)
+        st, det, _ = self.http("GET", f"/api/publications/{v2}", token=self.tok_pub)
+        self.assertTrue(det["stale"])
+        self.assertNotEqual(det["current_corpus_sha256"],
+                            det["publication"]["corpus_sha256"])
+        # review page flags it and offers refresh instead of activation
+        st, page, _ = self.http("GET", f"/review?token={self.tok_pub}", raw=True)
+        self.assertIn(b"STALE", page)
+        self.assertIn(b"/review/refresh", page)
+        # activation is rejected; the serving version is untouched
+        st, body, _ = self.http("POST", f"/api/publications/{v2}/activate",
+                                token=self.tok_pub)
+        self.assertEqual(st, 409)
+        self.assertIn("stale", body["error"])
+        _, _, hdr = self.http("GET", "/api/range/A0", raw=True)
+        self.assertEqual(hdr.get("X-Corpus-Version"), str(v1))
+        # refresh keeps the threshold and unblocks activation
+        st, body, _ = self.http("POST", f"/api/publications/{v2}/refresh",
+                                token=self.tok_pub)
+        self.assertEqual(st, 200)
+        self.assertEqual(body["threshold_k"], 2)
+        self.assertTrue(body["was_stale"])
+        st, det, _ = self.http("GET", f"/api/publications/{v2}", token=self.tok_pub)
+        self.assertFalse(det["stale"])
+        st, body, _ = self.http("POST", f"/api/publications/{v2}/activate",
+                                token=self.tok_pub)
+        self.assertEqual(st, 200)
+        st, body, hdr = self.http("GET", "/api/range/A1", raw=True)
+        self.assertEqual(st, 200)
+        self.assertEqual(hdr.get("X-Corpus-Version"), str(v2))
+        # an active version can no longer be refreshed
+        st, _, _ = self.http("POST", f"/api/publications/{v2}/refresh",
+                             token=self.tok_pub)
+        self.assertEqual(st, 409)
 
 
 if __name__ == "__main__":

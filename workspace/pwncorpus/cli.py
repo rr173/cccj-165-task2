@@ -44,7 +44,12 @@ def main(argv=None) -> int:
     p.add_argument("--k", type=int, default=core.DEFAULT_THRESHOLD_K,
                    help="minimum bucket set size")
 
-    p = sub.add_parser("activate", help="atomically activate a candidate")
+    p = sub.add_parser("activate", help="atomically activate a candidate "
+                       "(rejected if the draft is stale)")
+    p.add_argument("--version", type=int, required=True)
+
+    p = sub.add_parser("refresh", help="re-snapshot a stale candidate from "
+                       "current source data, keeping its threshold k")
     p.add_argument("--version", type=int, required=True)
 
     p = sub.add_parser("retract", help="retract a batch (effective next build)")
@@ -113,6 +118,10 @@ def main(argv=None) -> int:
 
         if args.cmd == "activate":
             print(json.dumps(core.activate(conn, args.version), indent=2))
+            return 0
+
+        if args.cmd == "refresh":
+            print(json.dumps(core.refresh_candidate(conn, args.version), indent=2))
             return 0
 
         if args.cmd == "retract":

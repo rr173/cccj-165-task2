@@ -152,8 +152,15 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                     if not self._require(conn, "publish"):
                         return
                     return self._json(200, core.activate(conn, int(m.group(1))))
+                m = re.fullmatch(r"/api/publications/(\d+)/refresh", path)
+                if m:
+                    if not self._require(conn, "publish"):
+                        return
+                    return self._json(200, core.refresh_candidate(conn, int(m.group(1))))
                 if path == "/review/activate":
                     return self._review_activate(conn)
+                if path == "/review/refresh":
+                    return self._review_refresh(conn)
                 return self._error(404, "not found")
             except core.NotFound as exc:
                 return self._error(404, str(exc))
@@ -192,8 +199,12 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
             pub = core.get_publication(conn, version)
             active_v = core.current_version(conn)
             out = {"publication": pub, "active_version": active_v}
-            if pub["status"] == "candidate" and active_v is not None:
-                out["diff_vs_active"] = core.diff_versions(conn, active_v, version)
+            if pub["status"] == "candidate":
+                cur = core.current_corpus_hash(conn)
+                out["current_corpus_sha256"] = cur
+                out["stale"] = pub["corpus_sha256"] != cur
+                if active_v is not None:
+                    out["diff_vs_active"] = core.diff_versions(conn, active_v, version)
             return self._json(200, out)
 
         def _manifest(self, conn, version):
@@ -219,14 +230,56 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                 version = int(form.get("version", ["0"])[0])
             except ValueError:
                 return self._error(400, "bad version")
+            tok_q = f"?token={html.escape(token)}"
             try:
                 core.activate(conn, version)
             except core.CorpusError as exc:
-                return self._error(409, str(exc))
-            tok_q = f"?token={html.escape(token)}"
+                # e.g. the draft went stale: source data committed first, so
+                # this confirmation has no effect and the serving version is
+                # unchanged. Offer to refresh the draft instead.
+                return self._send(
+                    409,
+                    f"<html><body><h2>Activation of v{version} rejected</h2>"
+                    f"<p>{html.escape(str(exc))}</p>"
+                    f"<p><a href='/review{tok_q}'>back to review</a></p></body></html>",
+                    "text/html; charset=utf-8",
+                )
             self._send(
                 200,
                 f"<html><body><h2>Publication v{version} activated</h2>"
+                f"<p><a href='/review{tok_q}'>back to review</a></p></body></html>",
+                "text/html; charset=utf-8",
+            )
+
+        def _review_refresh(self, conn):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0 or length > 65536:
+                return self._error(400, "bad form")
+            form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+            token = form.get("token", [""])[0]
+            row = core.lookup_token(conn, token) if token else None
+            if row is None or "publish" not in row["scopes"].split(","):
+                return self._error(403, "invalid token or missing 'publish' scope")
+            try:
+                version = int(form.get("version", ["0"])[0])
+            except ValueError:
+                return self._error(400, "bad version")
+            tok_q = f"?token={html.escape(token)}"
+            try:
+                result = core.refresh_candidate(conn, version)
+            except core.CorpusError as exc:
+                return self._send(
+                    409,
+                    f"<html><body><h2>Refresh of v{version} rejected</h2>"
+                    f"<p>{html.escape(str(exc))}</p>"
+                    f"<p><a href='/review{tok_q}'>back to review</a></p></body></html>",
+                    "text/html; charset=utf-8",
+                )
+            self._send(
+                200,
+                f"<html><body><h2>Candidate v{version} refreshed</h2>"
+                f"<p>re-snapshotted current source data, threshold k kept at "
+                f"{result['threshold_k']}. Re-review the diff before activating.</p>"
                 f"<p><a href='/review{tok_q}'>back to review</a></p></body></html>",
                 "text/html; charset=utf-8",
             )
@@ -272,9 +325,28 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
 
             activate_html = ""
             if state["candidate"]:
-                v = state["candidate"]["version"]
-                activate_html = f"""
+                c = state["candidate"]
+                v = c["version"]
+                if c.get("stale"):
+                    activate_html = f"""
+                <div class='card stale'><h3>Candidate v{v} is STALE &mdash; activation blocked</h3>
+                <p>Source data changed after this draft was built (batch added,
+                retracted or corrected), so it no longer matches the current
+                corpus. Activating it would overwrite the newer state with an
+                old snapshot and is rejected. Refresh re-snapshots the current
+                data while keeping the original threshold k={c['threshold_k']};
+                you can then re-review the diff and activate.</p>
+                <form method='post' action='/review/refresh'>
+                  <input type='hidden' name='version' value='{v}'>
+                  <label>re-enter publish token:
+                    <input type='password' name='token' required></label>
+                  <button type='submit'>Refresh draft v{v} (keep k={c['threshold_k']})</button>
+                </form></div>"""
+                else:
+                    activate_html = f"""
                 <div class='card'><h3>Activate candidate v{v}</h3>
+                <p class='muted'>draft matches the current source data
+                (corpus {e(c['corpus_sha256'][:16])}&hellip;)</p>
                 <form method='post' action='/review/activate'
                       onsubmit="return confirm('Activate publication v{v}? Old version stays verifiable but stops serving queries.');">
                   <input type='hidden' name='version' value='{v}'>
@@ -304,10 +376,12 @@ body{{font-family:system-ui,sans-serif;margin:2rem;background:#f6f7f9;color:#222
 .card{{background:#fff;border:1px solid #ddd;border-radius:8px;padding:1rem;margin:1rem 0}}
 table{{border-collapse:collapse;font-size:.9rem}}td,th{{border:1px solid #ccc;padding:.3rem .6rem;text-align:left}}
 th{{background:#eee}}.mono{{font-family:monospace}}.muted{{color:#777;font-size:.8rem}}
+.stale{{border-color:#c33;background:#fff8f8}}
 button{{padding:.4rem 1rem}}</style></head><body>
 <h2>Publication review</h2>
 <p>active batches: {s['active_batches']} &nbsp; retracted: {s['retracted_batches']}
-   &nbsp; corrections pending: {s['corrections']}</p>
+   &nbsp; corrections pending: {s['corrections']} &nbsp;
+   <span class='mono'>current corpus: {e(state['corpus_sha256'][:16])}&hellip;</span></p>
 {pub_card('Active publication (serving queries)', state['active'])}
 {pub_card('Latest candidate (not serving)', state['candidate'])}
 {diff_html}

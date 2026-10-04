@@ -207,6 +207,19 @@ def _active_corpus(conn) -> list[tuple[str, int]]:
     return sorted((r["h"], r["c"]) for r in rows)
 
 
+def _corpus_hash(corpus) -> str:
+    return hashlib.sha256(
+        "\n".join(f"{h}:{c}" for h, c in corpus).encode()
+    ).hexdigest()
+
+
+def current_corpus_hash(conn) -> str:
+    """Hash of the live corpus (active batches minus retractions/corrections).
+    A candidate is 'stale' when this no longer matches the corpus hash that
+    was recorded when the candidate was built."""
+    return _corpus_hash(_active_corpus(conn))
+
+
 def _bucketize(corpus, prefix_len: int) -> dict[str, list[tuple[str, int]]]:
     buckets: dict[str, list[tuple[str, int]]] = defaultdict(list)
     for h, c in corpus:
@@ -239,9 +252,7 @@ def build_candidate(conn, k: int = DEFAULT_THRESHOLD_K) -> dict:
     if not isinstance(k, int) or not (1 <= k <= MAX_THRESHOLD_K):
         raise CorpusError("invalid threshold k")
     corpus = _active_corpus(conn)  # single-statement snapshot
-    corpus_hash = hashlib.sha256(
-        "\n".join(f"{h}:{c}" for h, c in corpus).encode()
-    ).hexdigest()
+    corpus_hash = _corpus_hash(corpus)
     buckets = _bucketize(corpus, PREFIX_LEN)
     kept = {p: v for p, v in buckets.items() if len(v) >= k}
     suppressed = len(buckets) - len(kept)
@@ -276,15 +287,28 @@ def build_candidate(conn, k: int = DEFAULT_THRESHOLD_K) -> dict:
 def activate(conn, version: int) -> dict:
     """Atomically switch the active publication. Single write transaction:
     old active -> retired, candidate -> active, pointer swap. Concurrent
-    queries see either the old or the new version, never a mix."""
+    queries see either the old or the new version, never a mix.
+
+    The candidate must still match the live corpus: its stored corpus hash is
+    re-checked against the current source data INSIDE the write transaction,
+    which serialises against concurrent ingests/retractions/corrections. If a
+    source update committed first, the check fails and the activation is
+    rejected, leaving the serving version untouched; if the activation
+    commits first, the later source update simply waits for the next build.
+    """
     with db.write_tx(conn):
         row = conn.execute(
-            "SELECT status FROM publications WHERE version = ?", (version,)
+            "SELECT status, corpus_sha256 FROM publications WHERE version = ?",
+            (version,),
         ).fetchone()
         if row is None:
             raise NotFound("publication not found")
         if row["status"] != "candidate":
             raise Conflict(f"publication {version} is '{row['status']}'; only a candidate can be activated")
+        if row["corpus_sha256"] != _corpus_hash(_active_corpus(conn)):
+            raise Conflict(
+                f"publication {version} is stale: source data changed after the"
+                " draft was built; refresh the candidate and re-review")
         now = utcnow()
         conn.execute(
             "UPDATE publications SET status='retired', retired_at=? WHERE status='active'",
@@ -300,6 +324,53 @@ def activate(conn, version: int) -> dict:
             (str(version),),
         )
     return {"version": version, "status": "active"}
+
+
+def refresh_candidate(conn, version: int) -> dict:
+    """Re-materialise a candidate from the CURRENT source data, keeping its
+    original threshold k (and prefix length). This is how a stale draft is
+    brought up to date so it can be previewed and activated again. Only
+    candidates can be refreshed; the serving version is never touched."""
+    with db.write_tx(conn):
+        row = conn.execute(
+            "SELECT status, threshold_k, prefix_len, corpus_sha256"
+            " FROM publications WHERE version = ?",
+            (version,),
+        ).fetchone()
+        if row is None:
+            raise NotFound("publication not found")
+        if row["status"] != "candidate":
+            raise Conflict(f"publication {version} is '{row['status']}'; only a candidate can be refreshed")
+        corpus = _active_corpus(conn)
+        corpus_hash = _corpus_hash(corpus)
+        was_stale = corpus_hash != row["corpus_sha256"]
+        k = row["threshold_k"]
+        prefix_len = row["prefix_len"]
+        buckets = _bucketize(corpus, prefix_len)
+        kept = {p: v for p, v in buckets.items() if len(v) >= k}
+        suppressed = len(buckets) - len(kept)
+        suffix_count = sum(len(v) for v in kept.values())
+        now = utcnow()
+        conn.execute("DELETE FROM pub_buckets WHERE version = ?", (version,))
+        conn.executemany(
+            "INSERT INTO pub_buckets(version, prefix, suffix, cnt) VALUES (?,?,?,?)",
+            [(version, p, s, c) for p, entries in kept.items() for s, c in entries],
+        )
+        manifest = _manifest_payload(version, k, now, kept, prefix_len)
+        mhash = hashlib.sha256(canonical_json(manifest).encode()).hexdigest()
+        conn.execute(
+            "UPDATE publications SET created_at=?, bucket_count=?, suffix_count=?,"
+            " suppressed_bucket_count=?, corpus_sha256=?, manifest_sha256=?"
+            " WHERE version=?",
+            (now, len(kept), suffix_count, suppressed, corpus_hash, mhash, version),
+        )
+    return {
+        "version": version, "status": "candidate", "refreshed": True,
+        "was_stale": was_stale, "threshold_k": k, "prefix_len": prefix_len,
+        "bucket_count": len(kept), "suffix_count": suffix_count,
+        "suppressed_bucket_count": suppressed,
+        "corpus_sha256": corpus_hash, "manifest_sha256": mhash,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -391,6 +462,10 @@ def review_state(conn) -> dict:
     pubs = list_publications(conn)
     active = next((p for p in pubs if p["status"] == "active"), None)
     candidate = next((p for p in pubs if p["status"] == "candidate"), None)
+    corpus_hash = current_corpus_hash(conn)
+    if candidate is not None:
+        # stale = the draft no longer reflects the current source data
+        candidate["stale"] = candidate["corpus_sha256"] != corpus_hash
     diff = None
     if active and candidate:
         diff = diff_versions(conn, active["version"], candidate["version"])
@@ -403,7 +478,7 @@ def review_state(conn) -> dict:
     return {
         "active": active, "candidate": candidate, "diff": diff,
         "publications": pubs, "batches": list_batches(conn),
-        "stats": dict(stats),
+        "stats": dict(stats), "corpus_sha256": corpus_hash,
     }
 
 
